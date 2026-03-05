@@ -290,3 +290,40 @@ async def rebuild_pdf(
             os.unlink(tmp_in_path)
         if os.path.exists(tmp_out_path):
             os.unlink(tmp_out_path)
+
+
+# ─────────────────────────────────────────────
+# ENDPOINT 2: Rebuild PDF
+# ─────────────────────────────────────────────
+@app.post("/rebuild/pdf")
+async def rebuild_pdf_endpoint(
+    file: UploadFile = File(...),
+    rebuild_payload: str = Form(...),
+    translation_map: str = Form(...),
+    target_language: str = Form(default="vi"),
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    try:
+        payload = json.loads(rebuild_payload)
+        trans_map = json.loads(translation_map)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    content = await file.read()
+
+    from rebuild_pdf import rebuild_pdf
+    pdf_bytes = rebuild_pdf(content, payload, trans_map)
+
+    original_name = file.filename.replace(".pdf", "")
+    output_filename = f"{original_name}_translated_{target_language}.pdf"
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{output_filename}"',
+            "Content-Length": str(len(pdf_bytes))
+        }
+    )
