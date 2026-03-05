@@ -1,7 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 import pdfplumber
-import fitz  # PyMuPDF
 import hashlib
 import os
 import io
