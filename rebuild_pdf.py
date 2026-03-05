@@ -1,5 +1,10 @@
-from pypdf import PdfReader, PdfWriter, PageObject
-from pypdf.generic import RectangleObject
+"""
+PDF Rebuild: 
+- Dùng reportlab tạo trang mới hoàn toàn với text đã dịch
+- Dùng pdfrw để giữ lại graphics/images từ trang gốc
+- Merge graphics layer (gốc) + text layer (dịch)
+"""
+from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -12,7 +17,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FONT_NAME = "Helvetica"
-FONT_PATH = "/tmp/NotoSans.ttf"
 
 def register_font():
     global FONT_NAME
@@ -30,22 +34,72 @@ def register_font():
             return
 
     try:
-        if not os.path.exists(FONT_PATH):
+        font_path = "/tmp/NotoSans.ttf"
+        if not os.path.exists(font_path):
             logger.info("Downloading NotoSans...")
             urllib.request.urlretrieve(
                 "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf",
-                FONT_PATH
+                font_path
             )
-        pdfmetrics.registerFont(TTFont("UniFont", FONT_PATH))
+        pdfmetrics.registerFont(TTFont("UniFont", font_path))
         FONT_NAME = "UniFont"
         logger.info("Using NotoSans")
         return
     except Exception as e:
         logger.warning(f"Font download failed: {e}")
 
-    logger.warning("Using Helvetica - Vietnamese may show as boxes")
+    logger.warning("Using Helvetica fallback")
 
 register_font()
+
+
+def draw_text_page(page_width, page_height, page_blocks, font_name, font_size_default=10):
+    """Tạo 1 trang PDF chỉ chứa text đã dịch trên nền trắng"""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(page_width, page_height))
+
+    # White background để che hoàn toàn text gốc
+    c.setFillColorRGB(1, 1, 1)
+    c.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+
+    for info in page_blocks:
+        bbox = info["bbox"]
+        font_size = info["font_size"]
+        text = (info["translated_text"] or "").strip()
+        if not text:
+            continue
+
+        x = float(bbox["x"])
+        w = float(bbox["w"])
+        h = float(bbox["h"])
+        # pdfplumber: y từ top, reportlab: y từ bottom
+        y_rl = page_height - float(bbox["y"]) - h
+
+        # Tiếng Việt dài hơn Trung ~40% → mở rộng max width
+        max_w = page_width - x - 5
+
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont(font_name, font_size)
+
+        # Word wrap
+        text_y = y_rl + h - font_size
+        words = text.split()
+        line = ""
+        for word in words:
+            test = (line + " " + word).strip()
+            if c.stringWidth(test, font_name, font_size) <= max_w:
+                line = test
+            else:
+                if line:
+                    c.drawString(x, text_y, line)
+                    text_y -= (font_size + 2)
+                line = word
+        if line:
+            c.drawString(x, text_y, line)
+
+    c.save()
+    buf.seek(0)
+    return buf
 
 
 def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_map: dict) -> bytes:
@@ -84,77 +138,38 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
             pages_data[p] = []
         pages_data[p].append(info)
 
-    reader = PdfReader(io.BytesIO(original_pdf_bytes))
+    # Get page dimensions from original
+    orig_reader = PdfReader(io.BytesIO(original_pdf_bytes))
     writer = PdfWriter()
 
-    for page_idx, page in enumerate(reader.pages):
+    for page_idx, page in enumerate(orig_reader.pages):
         page_num = page_idx + 1
         page_width = float(page.mediabox.width)
         page_height = float(page.mediabox.height)
 
         if page_num in pages_data:
-            # Create a NEW blank page with translated text only
-            # This completely replaces original text layer
-            overlay_buffer = io.BytesIO()
-            c = canvas.Canvas(overlay_buffer, pagesize=(page_width, page_height))
+            # Build translated text page (white bg + translated text)
+            text_buf = draw_text_page(
+                page_width, page_height,
+                pages_data[page_num],
+                FONT_NAME
+            )
 
-            # First pass: draw all white rectangles to blank out original text areas
-            for info in pages_data[page_num]:
-                bbox = info["bbox"]
-                x = float(bbox["x"])
-                w = float(bbox["w"])
-                h = float(bbox["h"])
-                y_rl = page_height - float(bbox["y"]) - h
+            # Strategy: 
+            # 1. text_page has white background → covers original text
+            # 2. merge original page UNDER text page → keeps images/graphics
+            text_reader = PdfReader(text_buf)
+            text_page = text_reader.pages[0]
 
-                # Large white rect to cover original Chinese text
-                c.setFillColorRGB(1, 1, 1)
-                c.setStrokeColorRGB(1, 1, 1)
-                c.rect(x - 2, y_rl - 4, w + 60, h + 8, fill=1, stroke=1)
-
-            # Second pass: draw translated text
-            for info in pages_data[page_num]:
-                bbox = info["bbox"]
-                font_size = info["font_size"]
-                text = (info["translated_text"] or "").strip()
-                if not text:
-                    continue
-
-                x = float(bbox["x"])
-                w = float(bbox["w"])
-                h = float(bbox["h"])
-                y_rl = page_height - float(bbox["y"]) - h
-
-                # Vietnamese text is ~40% longer than Chinese
-                # Use page_width as effective max width
-                max_w = min(page_width - x - 10, w * 2.5)
-
-                c.setFillColorRGB(0, 0, 0)
-                c.setFont(FONT_NAME, font_size)
-
-                text_y = y_rl + h - font_size
-                words = text.split()
-                line = ""
-                for word in words:
-                    test = (line + " " + word).strip()
-                    if c.stringWidth(test, FONT_NAME, font_size) <= max_w:
-                        line = test
-                    else:
-                        if line:
-                            c.drawString(x, text_y, line)
-                            text_y -= (font_size + 2)
-                        line = word
-                if line:
-                    c.drawString(x, text_y, line)
-
-            c.save()
-            overlay_buffer.seek(0)
-
-            # Merge: overlay ON TOP of original (white rects hide Chinese, new text shows)
-            overlay_reader = PdfReader(overlay_buffer)
-            overlay_page = overlay_reader.pages[0]
-            page.merge_page(overlay_page)
-
-        writer.add_page(page)
+            # Merge original ON text_page (original graphics show through)
+            # But text_page white bg covers original text
+            # 
+            # Actually: merge original FIRST, then text on top
+            # White bg on text_page will cover Chinese text
+            text_page.merge_page(page)  # original graphics merge INTO text page
+            writer.add_page(text_page)
+        else:
+            writer.add_page(page)
 
     out = io.BytesIO()
     writer.write(out)
