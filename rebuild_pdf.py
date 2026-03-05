@@ -9,16 +9,12 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Register Unicode font
-FONT_NAME = "DejaVuSans"
-FONT_REGISTERED = False
+# Global font config
+FONT_NAME = "Helvetica"  # default fallback
 
 def register_font():
-    global FONT_REGISTERED
-    if FONT_REGISTERED:
-        return
+    global FONT_NAME
 
-    # Common paths for DejaVu font on Linux/Render
     font_paths = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -28,21 +24,22 @@ def register_font():
 
     for path in font_paths:
         if os.path.exists(path):
-            pdfmetrics.registerFont(TTFont(FONT_NAME, path))
-            FONT_REGISTERED = True
-            logger.info(f"Font registered from: {path}")
-            return
+            try:
+                pdfmetrics.registerFont(TTFont("DejaVuSans", path))
+                FONT_NAME = "DejaVuSans"
+                logger.info(f"Font registered: {path}")
+                return
+            except Exception as e:
+                logger.warning(f"Font register failed: {e}")
 
-    # Fallback: download at runtime
-    logger.warning("DejaVu font not found locally, using Helvetica fallback")
-    global FONT_NAME
-    FONT_NAME = "Helvetica"
-    FONT_REGISTERED = True
+    logger.warning("DejaVu not found, using Helvetica (Vietnamese may show as boxes)")
+
+
+# Register once at module load
+register_font()
 
 
 def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_map: dict) -> bytes:
-    register_font()
-
     logger.info(f"Rebuild start. Segments: {len(translation_map)}, Font: {FONT_NAME}")
 
     # Build block_map
@@ -101,18 +98,16 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
                 x = float(bbox["x"])
                 w = float(bbox["w"])
                 h = float(bbox["h"])
-                # pdfplumber top-down → reportlab bottom-up
                 y_rl = page_height - float(bbox["y"]) - h
 
                 # White overlay
                 c.setFillColorRGB(1, 1, 1)
                 c.rect(x - 1, y_rl - 2, w + 2, h + 4, fill=1, stroke=0)
 
-                # Vietnamese text
+                # Draw text
                 c.setFillColorRGB(0, 0, 0)
                 c.setFont(FONT_NAME, font_size)
 
-                # Word wrap
                 text_y = y_rl + h - font_size - 1
                 words = text.split()
                 line = ""
@@ -132,7 +127,6 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
 
             c.save()
             overlay_buffer.seek(0)
-
             overlay_page = PdfReader(overlay_buffer).pages[0]
             page.merge_page(overlay_page)
 
