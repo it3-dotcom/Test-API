@@ -8,7 +8,7 @@ import json
 import tempfile
 from datetime import datetime
 
-app = FastAPI(title="PDF Extractor API", version="2.0.0")
+app = FastAPI(title="PDF Extractor API", version="3.0.0")
 
 
 @app.get("/")
@@ -190,105 +190,6 @@ async def rebuild_pdf(
         trans_map = json.loads(translation_map)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
-
-    # Build segment_id → {bbox, page, font_size} map từ structure
-    block_map = {}
-    for unit in payload.get("structure", {}).get("document_units", []):
-        if unit.get("unit_type") == "text_block":
-            spans = unit.get("lines", [{}])[0].get("spans", [{}])
-            font_size = spans[0].get("font_size", 11) if spans else 11
-            block_map[unit["unit_id"]] = {
-                "page_number": unit["page_number"],
-                "bbox": unit["bbox"],
-                "font_size": font_size
-            }
-
-    # Build seg_id → block info map
-    # (dùng segment list từ payload nếu có, hoặc map qua unit_id)
-    seg_to_block = {}
-    # payload structure không có segments → dùng naming convention
-    # seg_pdf_001 → block_001
-    for seg_id, translated_text in trans_map.items():
-        # Extract block number từ seg_id
-        # seg_pdf_001 → block_001
-        num = seg_id.replace("seg_pdf_", "")
-        block_id = f"block_{num}"
-        if block_id in block_map:
-            seg_to_block[seg_id] = {
-                **block_map[block_id],
-                "translated_text": translated_text
-            }
-
-    # Save original PDF to temp
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_in:
-        content = await file.read()
-        tmp_in.write(content)
-        tmp_in_path = tmp_in.name
-
-    tmp_out_path = tmp_in_path.replace(".pdf", "_translated.pdf")
-
-    try:
-        doc = fitz.open(tmp_in_path)
-
-        for seg_id, info in seg_to_block.items():
-            translated_text = info.get("translated_text", "")
-            if not translated_text:
-                continue
-
-            page_num = info["page_number"] - 1  # fitz 0-indexed
-            bbox = info["bbox"]
-            font_size = info["font_size"]
-
-            if page_num >= len(doc):
-                continue
-
-            page = doc[page_num]
-
-            # Tọa độ fitz: (x0, y0, x1, y1)
-            x0 = bbox["x"]
-            y0 = bbox["y"]
-            x1 = bbox["x"] + bbox["w"]
-            y1 = bbox["y"] + bbox["h"]
-            rect = fitz.Rect(x0, y0, x1, y1)
-
-            # Xóa text gốc bằng cách vẽ rectangle trắng đè lên
-            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
-
-            # Chèn text đã dịch vào đúng vị trí
-            page.insert_textbox(
-                rect,
-                translated_text,
-                fontsize=font_size,
-                fontname="helv",        # Helvetica - hỗ trợ Unicode tốt
-                color=(0, 0, 0),
-                align=0                 # left align
-            )
-
-        # Save output PDF
-        doc.save(tmp_out_path, garbage=4, deflate=True)
-        doc.close()
-
-        # Read output and return as file download
-        with open(tmp_out_path, "rb") as f:
-            pdf_bytes = f.read()
-
-        original_name = file.filename.replace(".pdf", "")
-        output_filename = f"{original_name}_translated_{target_language}.pdf"
-
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f'attachment; filename="{output_filename}"',
-                "Content-Length": str(len(pdf_bytes))
-            }
-        )
-
-    finally:
-        if os.path.exists(tmp_in_path):
-            os.unlink(tmp_in_path)
-        if os.path.exists(tmp_out_path):
-            os.unlink(tmp_out_path)
 
 
 # ─────────────────────────────────────────────
