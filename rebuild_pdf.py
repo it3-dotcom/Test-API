@@ -1,21 +1,51 @@
-"""
-PDF Rebuild module using pypdf + reportlab
-Strategy: overlay translated text on top of original PDF
-"""
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 import io
+import os
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Register Unicode font
+FONT_NAME = "DejaVuSans"
+FONT_REGISTERED = False
+
+def register_font():
+    global FONT_REGISTERED
+    if FONT_REGISTERED:
+        return
+
+    # Common paths for DejaVu font on Linux/Render
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/DejaVuSans.ttf",
+    ]
+
+    for path in font_paths:
+        if os.path.exists(path):
+            pdfmetrics.registerFont(TTFont(FONT_NAME, path))
+            FONT_REGISTERED = True
+            logger.info(f"Font registered from: {path}")
+            return
+
+    # Fallback: download at runtime
+    logger.warning("DejaVu font not found locally, using Helvetica fallback")
+    global FONT_NAME
+    FONT_NAME = "Helvetica"
+    FONT_REGISTERED = True
+
 
 def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_map: dict) -> bytes:
-    logger.info(f"Starting rebuild. Segments to translate: {len(translation_map)}")
-    logger.info(f"Document units: {len(rebuild_payload.get('structure', {}).get('document_units', []))}")
+    register_font()
 
-    # Build block_map: unit_id → {page, bbox, font_size}
+    logger.info(f"Rebuild start. Segments: {len(translation_map)}, Font: {FONT_NAME}")
+
+    # Build block_map
     block_map = {}
     for unit in rebuild_payload.get("structure", {}).get("document_units", []):
         if unit.get("unit_type") == "text_block":
@@ -27,9 +57,7 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
                 "font_size": max(6, min(float(font_size), 12))
             }
 
-    logger.info(f"Block map size: {len(block_map)}")
-
-    # Build seg → block mapping
+    # Map seg → block
     seg_to_block = {}
     for seg_id, translated_text in translation_map.items():
         num = seg_id.replace("seg_pdf_", "")
@@ -40,17 +68,17 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
                 "translated_text": translated_text
             }
 
-    logger.info(f"Matched segments: {len(seg_to_block)}")
+    logger.info(f"Matched: {len(seg_to_block)}/{len(translation_map)}")
 
     # Group by page
     pages_data = {}
-    for seg_id, info in seg_to_block.items():
-        page_num = info["page_number"]
-        if page_num not in pages_data:
-            pages_data[page_num] = []
-        pages_data[page_num].append(info)
+    for info in seg_to_block.values():
+        p = info["page_number"]
+        if p not in pages_data:
+            pages_data[p] = []
+        pages_data[p].append(info)
 
-    # Read original PDF
+    # Process PDF
     reader = PdfReader(io.BytesIO(original_pdf_bytes))
     writer = PdfWriter()
 
@@ -59,8 +87,6 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
         page_width = float(page.mediabox.width)
         page_height = float(page.mediabox.height)
 
-        logger.info(f"Processing page {page_num}: {page_width}x{page_height}")
-
         if page_num in pages_data:
             overlay_buffer = io.BytesIO()
             c = canvas.Canvas(overlay_buffer, pagesize=(page_width, page_height))
@@ -68,37 +94,31 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
             for info in pages_data[page_num]:
                 bbox = info["bbox"]
                 font_size = info["font_size"]
-                text = info["translated_text"] or ""
-
-                if not text.strip():
+                text = (info["translated_text"] or "").strip()
+                if not text:
                     continue
 
                 x = float(bbox["x"])
                 w = float(bbox["w"])
                 h = float(bbox["h"])
-                
-                # pdfplumber: y=0 at TOP, increases downward
-                # reportlab: y=0 at BOTTOM, increases upward
-                # Convert: reportlab_y = page_height - pdfplumber_y - h
+                # pdfplumber top-down → reportlab bottom-up
                 y_rl = page_height - float(bbox["y"]) - h
 
-                logger.info(f"  Block at x={x}, y_rl={y_rl}, w={w}, h={h}, font={font_size}, text={text[:20]}")
-
-                # White rectangle to cover original text
+                # White overlay
                 c.setFillColorRGB(1, 1, 1)
-                c.rect(x - 1, y_rl - 1, w + 2, h + 2, fill=1, stroke=0)
+                c.rect(x - 1, y_rl - 2, w + 2, h + 4, fill=1, stroke=0)
 
-                # Translated text
+                # Vietnamese text
                 c.setFillColorRGB(0, 0, 0)
-                c.setFont("Helvetica", font_size)
+                c.setFont(FONT_NAME, font_size)
 
-                # Simple text with wrap
+                # Word wrap
                 text_y = y_rl + h - font_size - 1
                 words = text.split()
                 line = ""
                 for word in words:
                     test = (line + " " + word).strip()
-                    if c.stringWidth(test, "Helvetica", font_size) <= w:
+                    if c.stringWidth(test, FONT_NAME, font_size) <= w:
                         line = test
                     else:
                         if line:
@@ -113,15 +133,12 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
             c.save()
             overlay_buffer.seek(0)
 
-            # Merge overlay onto page
-            overlay_reader = PdfReader(overlay_buffer)
-            overlay_page = overlay_reader.pages[0]
+            overlay_page = PdfReader(overlay_buffer).pages[0]
             page.merge_page(overlay_page)
 
         writer.add_page(page)
 
-    output_buffer = io.BytesIO()
-    writer.write(output_buffer)
-    result = output_buffer.getvalue()
-    logger.info(f"Output PDF size: {len(result)} bytes")
-    return result
+    out = io.BytesIO()
+    writer.write(out)
+    logger.info(f"Output size: {out.tell()} bytes")
+    return out.getvalue()
