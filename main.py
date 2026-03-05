@@ -171,26 +171,6 @@ async def extract_pdf(
         os.unlink(tmp_path)
 
 
-# ─────────────────────────────────────────────
-# ENDPOINT 2: Rebuild PDF từ rebuild_payload + translation_map
-# ─────────────────────────────────────────────
-@app.post("/rebuild/pdf")
-async def rebuild_pdf(
-    file: UploadFile = File(...),           # file PDF gốc
-    rebuild_payload: str = Form(...),       # JSON string: rebuild_payload từ Drive
-    translation_map: str = Form(...),       # JSON string: {seg_id: translated_text}
-    target_language: str = Form(default="vi"),
-):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-    # Parse JSON inputs
-    try:
-        payload = json.loads(rebuild_payload)
-        trans_map = json.loads(translation_map)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
-
 
 # ─────────────────────────────────────────────
 # ENDPOINT 2: Rebuild PDF

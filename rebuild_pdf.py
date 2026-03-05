@@ -4,33 +4,32 @@ Strategy: overlay translated text on top of original PDF
 """
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 import io
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_map: dict) -> bytes:
-    """
-    Rebuild PDF bằng cách:
-    1. Đọc PDF gốc
-    2. Với mỗi trang, tạo overlay layer chứa text đã dịch
-    3. Merge overlay lên trang gốc (xóa vùng text cũ, ghi text mới)
-    """
+    logger.info(f"Starting rebuild. Segments to translate: {len(translation_map)}")
+    logger.info(f"Document units: {len(rebuild_payload.get('structure', {}).get('document_units', []))}")
 
     # Build block_map: unit_id → {page, bbox, font_size}
     block_map = {}
     for unit in rebuild_payload.get("structure", {}).get("document_units", []):
         if unit.get("unit_type") == "text_block":
             spans = unit.get("lines", [{}])[0].get("spans", [{}])
-            font_size = spans[0].get("font_size", 11) if spans else 11
+            font_size = spans[0].get("font_size", 10) if spans else 10
             block_map[unit["unit_id"]] = {
                 "page_number": unit["page_number"],
                 "bbox": unit["bbox"],
-                "font_size": min(font_size, 11)  # cap font size
+                "font_size": max(6, min(float(font_size), 12))
             }
 
-    # Build seg → block mapping (seg_pdf_001 → block_001)
+    logger.info(f"Block map size: {len(block_map)}")
+
+    # Build seg → block mapping
     seg_to_block = {}
     for seg_id, translated_text in translation_map.items():
         num = seg_id.replace("seg_pdf_", "")
@@ -40,6 +39,8 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
                 **block_map[block_id],
                 "translated_text": translated_text
             }
+
+    logger.info(f"Matched segments: {len(seg_to_block)}")
 
     # Group by page
     pages_data = {}
@@ -55,13 +56,12 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
 
     for page_idx, page in enumerate(reader.pages):
         page_num = page_idx + 1
-        
-        # Get page dimensions
         page_width = float(page.mediabox.width)
         page_height = float(page.mediabox.height)
 
+        logger.info(f"Processing page {page_num}: {page_width}x{page_height}")
+
         if page_num in pages_data:
-            # Create overlay with translated text
             overlay_buffer = io.BytesIO()
             c = canvas.Canvas(overlay_buffer, pagesize=(page_width, page_height))
 
@@ -73,49 +73,55 @@ def rebuild_pdf(original_pdf_bytes: bytes, rebuild_payload: dict, translation_ma
                 if not text.strip():
                     continue
 
-                x = bbox["x"]
-                # Convert PDF coordinate (top-down → bottom-up for reportlab)
-                y_top = bbox["y"]
-                y_bottom = page_height - y_top - bbox["h"]
-                w = bbox["w"]
-                h = bbox["h"]
+                x = float(bbox["x"])
+                w = float(bbox["w"])
+                h = float(bbox["h"])
+                
+                # pdfplumber: y=0 at TOP, increases downward
+                # reportlab: y=0 at BOTTOM, increases upward
+                # Convert: reportlab_y = page_height - pdfplumber_y - h
+                y_rl = page_height - float(bbox["y"]) - h
 
-                # Draw white rectangle to cover original text
+                logger.info(f"  Block at x={x}, y_rl={y_rl}, w={w}, h={h}, font={font_size}, text={text[:20]}")
+
+                # White rectangle to cover original text
                 c.setFillColorRGB(1, 1, 1)
-                c.rect(x, y_bottom, w, h, fill=1, stroke=0)
+                c.rect(x - 1, y_rl - 1, w + 2, h + 2, fill=1, stroke=0)
 
-                # Draw translated text
+                # Translated text
                 c.setFillColorRGB(0, 0, 0)
                 c.setFont("Helvetica", font_size)
-                
-                # Text box with word wrap
-                text_obj = c.beginText(x, y_bottom + h - font_size)
+
+                # Simple text with wrap
+                text_y = y_rl + h - font_size - 1
                 words = text.split()
                 line = ""
                 for word in words:
-                    test_line = line + " " + word if line else word
-                    if c.stringWidth(test_line, "Helvetica", font_size) <= w:
-                        line = test_line
+                    test = (line + " " + word).strip()
+                    if c.stringWidth(test, "Helvetica", font_size) <= w:
+                        line = test
                     else:
                         if line:
-                            text_obj.textLine(line)
+                            c.drawString(x, text_y, line)
+                            text_y -= (font_size + 2)
                         line = word
-                if line:
-                    text_obj.textLine(line)
-                c.drawText(text_obj)
+                        if text_y < y_rl:
+                            break
+                if line and text_y >= y_rl:
+                    c.drawString(x, text_y, line)
 
             c.save()
             overlay_buffer.seek(0)
 
-            # Merge overlay onto original page
-            from pypdf import PdfReader as PR
-            overlay_reader = PR(overlay_buffer)
+            # Merge overlay onto page
+            overlay_reader = PdfReader(overlay_buffer)
             overlay_page = overlay_reader.pages[0]
             page.merge_page(overlay_page)
 
         writer.add_page(page)
 
-    # Output
     output_buffer = io.BytesIO()
     writer.write(output_buffer)
-    return output_buffer.getvalue()
+    result = output_buffer.getvalue()
+    logger.info(f"Output PDF size: {len(result)} bytes")
+    return result
